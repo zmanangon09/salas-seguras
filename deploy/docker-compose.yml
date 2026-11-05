@@ -1,0 +1,153 @@
+# Salas de Chat Seguras: db, auth, stego y gateway. `setup` (perfil aparte) prepara secretos y certificado.
+name: salas-seguras
+
+x-python-service: &python-service
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status != 200)"]
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 10s
+
+x-migrate: &migrate
+  command: ["alembic", "upgrade", "head"]
+  pull_policy: never  # usa la imagen que construye su servicio; nunca la busca en un registry
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  networks: [data]
+  depends_on:
+    db:
+      condition: service_healthy
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password, db_auth_owner, db_auth_app, db_stego_owner, db_stego_app]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]  # lo mínimo del entrypoint de postgres
+    security_opt: ["no-new-privileges:true"]
+    networks: [data]
+    restart: unless-stopped
+
+  auth:
+    <<: *python-service
+    build: {context: .., dockerfile: services/Dockerfile, args: {SERVICE: auth}}
+    image: salas-seguras/auth
+    environment:
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost}
+    secrets: [db_auth_app, svc_hash_gateway, jwt_signing_key]
+    networks: [apps, data]
+    depends_on:
+      auth-migrate: {condition: service_completed_successfully}
+
+  auth-migrate:
+    <<: *migrate
+    image: salas-seguras/auth  # la construye `auth`; dos builds de la misma etiqueta chocan
+    secrets: [db_auth_owner]
+
+  # stego guarda cada análisis en su BD y los archivos sospechosos en stego_quarantine.
+  stego:
+    <<: *python-service
+    build: {context: .., dockerfile: services/Dockerfile, args: {SERVICE: stego}}
+    image: salas-seguras/stego
+    environment:
+      STEGO_QUARANTINE_DIR: /data
+      STEGO_CHI2_P: "0.995"  # umbrales calibrados
+      STEGO_RS_RATE: "0.15"
+    secrets: [db_stego_app, svc_hash_gateway]
+    volumes:
+      - stego_quarantine:/data  # solo stego lo monta; ninguna ruta lo sirve
+    networks: [apps, data]
+    # R10: un PNG de 20 MP ocupa ~600 MB en un worker; con 2 workers el contenedor no pasa de 2 GB.
+    mem_limit: 2g
+    pids_limit: 64
+    depends_on:
+      stego-migrate: {condition: service_completed_successfully}
+
+  stego-migrate:
+    <<: *migrate
+    image: salas-seguras/stego  # la construye `stego`
+    secrets: [db_stego_owner]
+
+  gateway:
+    build: {context: .., dockerfile: gateway/Dockerfile}
+    image: salas-seguras/gateway
+    ports: ["80:80", "443:443"]
+    secrets: [gateway_token_conf]
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
+    read_only: true
+    tmpfs: ["/var/cache/nginx:size=128m", /var/run, /tmp]  # con tope: ahí van los cuerpos de hasta 6 MB (R10)
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      public: {}
+      apps: {ipv4_address: 172.16.10.10}  # la única IP cuyo X-Forwarded-For creen los servicios
+    restart: unless-stopped
+
+  # Preparación, una vez antes del primer `up`: docker compose -f deploy/docker-compose.yml run --rm setup
+  # Genera lo que falta (secretos, certificado TLS y la imagen de más de 5 MB) y recalcula lo derivado;
+  # nunca reemplaza un secreto ni un certificado completo. Rotar: `... run --rm setup --rotate <secreto>`.
+  # Se construye como stego (cryptography, numpy y Pillow con versión fija, mismas capas en caché) pero
+  # con su propia etiqueta, y corre sin red. Solo puede escribir donde deja sus archivos: ni el compose
+  # ni los scripts quedan a su alcance.
+  setup:
+    profiles: [setup]
+    build: {context: .., dockerfile: services/Dockerfile, args: {SERVICE: stego}}
+    entrypoint: ["sh", "/deploy/setup.sh"]
+    user: root  # escribe en carpetas del host; en Linux, el uid 10001 de la imagen no puede
+    network_mode: none
+    volumes:
+      - ./setup.sh:/deploy/setup.sh:ro
+      - ./gen_secrets.py:/deploy/gen_secrets.py:ro
+      - ./secrets:/deploy/secrets
+      - ./certs:/deploy/certs
+      - ../postman/imagenes:/imagenes
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, FOWNER]  # crear archivos y fijar permisos en carpetas que son del host
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  public: {}
+  apps:
+    internal: true
+    ipam:
+      # El gateway lleva la IP fija 172.16.10.10, la única en la que confían los servicios
+      # para X-Forwarded-For (FORWARDED_ALLOW_IPS en services/Dockerfile). Las IP dinámicas salen
+      # de ip_range, así que nadie más puede tomarla. 172.16.x queda fuera de los rangos que Docker
+      # asigna por su cuenta, así que ninguna otra red (ni la de otro proyecto) choca con esta.
+      config: [{subnet: 172.16.10.0/24, ip_range: 172.16.10.128/25}]
+  data: {internal: true}
+
+volumes:
+  pgdata: {}
+  stego_quarantine: {}
+
+secrets:
+  postgres_password: {file: ./secrets/postgres_password}
+  db_auth_owner: {file: ./secrets/db_auth_owner}
+  db_auth_app: {file: ./secrets/db_auth_app}
+  db_stego_owner: {file: ./secrets/db_stego_owner}
+  db_stego_app: {file: ./secrets/db_stego_app}
+  jwt_signing_key: {file: ./secrets/jwt_signing_key}
+  gateway_token_conf: {file: ./secrets/gateway_token.conf}
+  svc_hash_gateway: {file: ./secrets/svc_hash_gateway}

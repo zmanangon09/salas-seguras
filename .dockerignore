@@ -1,0 +1,16 @@
+.git
+**/.venv
+**/__pycache__
+deploy/secrets
+deploy/certs
+**/*.pem
+**/*.key
+**/.env
+**/.env.*
+!**/.env.example
+# Si las pruebas vuelven: sus tokens y contraseñas fijos nunca deben llegar a una imagen
+**/tests
+services/shared/shared/testing.py
+# Imágenes personales de calibración y las de Postman: no entran a ninguna imagen
+services/stego/tools/calibracion
+postman

@@ -1,0 +1,18 @@
+[project]
+name = "auth-svc"
+version = "0.1.0"
+requires-python = ">=3.12"
+# chat-shared se instala aparte (sin dependency confusion).
+dependencies = ["pyjwt>=2.10"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["auth_svc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+

@@ -1,0 +1,20 @@
+# Secretos y certificados: los genera `docker compose -f deploy/docker-compose.yml run --rm setup`
+deploy/secrets/
+deploy/certs/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Entornos de Postman y reportes de Newman: guardan la contraseña del admin, los cuerpos y los JWT
+*.postman_environment.json
+newman/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Calibración del estegoanálisis (imágenes personales)
+services/stego/tools/calibracion/
